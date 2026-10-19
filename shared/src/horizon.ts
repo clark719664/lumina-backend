@@ -1,30 +1,14 @@
 /**
- * The one Horizon client.
+ * Shared Stellar Horizon API client.
  *
- * There used to be two — `indexer/src/horizon.ts` and
- * `graphql-server/src/horizon.ts` — and they had already drifted: the indexer's
- * was throttled and metered, the GraphQL server's was not, so the service with
- * the smaller request budget was the one left exposed to a 429. Every fix had
- * to be written twice and one copy was always forgotten.
- *
- * Both services' behaviour was a requirement, so this file is both: every
- * request is paced by the throttle, bounded by a timeout, retried on a 429
- * (honouring `Retry-After`) or a connection error, and reported to whichever
- * metrics registry the caller injects. The two failure styles the services need
- * — the indexer's ledger walk wants an exception, the GraphQL server's
- * database-then-Horizon fallback wants `null` — are one code path with a mode
- * rather than two implementations.
- *
- * Nothing here imports a service's logger, metrics or configuration: those are
- * injected. That is what lets the same file be compiled into both packages
- * without either service depending on the other.
+ * Used by both the indexer and the GraphQL server's fallback paths. All
+ * outbound requests are serialized through `createThrottle` so neither service
+ * can burst past Horizon's per-IP rate limit, and every response is validated
+ * against a runtime schema at the Horizon boundary before entering the indexer
+ * or GraphQL pipelines.
  */
-import { createThrottle, type ThrottleMetrics } from './throttle';
+import { createThrottle, type RequestPurpose, type ThrottleMetrics } from './throttle';
 
-/**
- * Horizon's page size, and the signal that another page exists.
- * See `docs/HORIZON_CONTRACT.md` for full field dependencies and contract details.
- */
 export const PAGE_LIMIT = 200;
 
 export interface HorizonLedger {
@@ -59,17 +43,15 @@ export interface HorizonOperation {
 }
 
 export interface HorizonBalance {
+  balance: string;
   asset_type: string;
   asset_code?: string;
   asset_issuer?: string;
-  balance: string;
   limit?: string;
-  buying_liabilities?: string;
-  selling_liabilities?: string;
 }
 
 export interface HorizonAccount {
-  /** Present on newer Horizon versions; `account_id` is the field both use. */
+  /** Horizon returns `account_id`; some legacy mocks also supply `id`. */
   id?: string;
   account_id: string;
   sequence: string;
@@ -82,13 +64,15 @@ export interface HorizonAccount {
     auth_required: boolean;
     auth_revocable: boolean;
     auth_immutable: boolean;
-    /** Absent on Horizon versions that predate clawback support. */
-    auth_clawback_enabled?: boolean;
+    auth_clawback_enabled: boolean;
   };
-  thresholds: { low_threshold: number; med_threshold: number; high_threshold: number };
+  thresholds: {
+    low_threshold: number;
+    med_threshold: number;
+    high_threshold: number;
+  };
 }
 
-/** The subset of a ledger tip both services read. */
 export interface HorizonLatestLedger {
   sequence: number;
   closed_at: string;
@@ -97,22 +81,33 @@ export interface HorizonLatestLedger {
   operation_count: number;
 }
 
+/**
+ * Price rational returned by Horizon for a trade execution.
+ * `n` is numerator, `d` is denominator (price = n / d in counter per base unit).
+ */
 export interface HorizonTradePrice {
-  n: number | string;
-  d: number | string;
+  n: string | number;
+  d: string | number;
 }
 
+/**
+ * Horizon `/trades` record shape.
+ */
 export interface HorizonTrade {
   id: string;
   paging_token: string;
   ledger_close_time: string;
+  offer_id?: string;
   trade_type?: string;
+  liquidity_pool_fee_bp?: number;
+  base_liquidity_pool_id?: string;
   base_offer_id?: string;
   base_account: string;
   base_amount: string;
   base_asset_type: string;
   base_asset_code?: string;
   base_asset_issuer?: string;
+  counter_liquidity_pool_id?: string;
   counter_offer_id?: string;
   counter_account?: string;
   counter_amount: string;
@@ -123,261 +118,710 @@ export interface HorizonTrade {
   price?: HorizonTradePrice;
 }
 
+/**
+ * Query parameters for fetching trades from Horizon `/trades`.
+ */
 export interface HorizonTradesFilter {
   cursor?: string;
-  order?: 'asc' | 'desc';
   limit?: number;
-  base_asset_type?: string;
-  base_asset_code?: string;
-  base_asset_issuer?: string;
-  counter_asset_type?: string;
-  counter_asset_code?: string;
-  counter_asset_issuer?: string;
-  offer_id?: string;
+  order?: 'asc' | 'desc';
+  baseAssetType?: string;
+  baseAssetCode?: string;
+  baseAssetIssuer?: string;
+  counterAssetType?: string;
+  counterAssetCode?: string;
+  counterAssetIssuer?: string;
+  offerId?: string;
+  accountId?: string;
 }
 
-interface HorizonPage<T> {
+export interface HorizonPage<T> {
   _embedded: { records: T[] };
-  _links: { next?: { href: string } };
+  _links?: { next?: { href: string } };
 }
 
-/** The `warn(fields, message)` shape both services' loggers already expose. */
-export interface HorizonLogSink {
-  warn(fields: Record<string, unknown>, message: string): void;
-}
-
-export interface HorizonClientOptions {
-  /** Label used in error messages and log lines. */
-  name?: string;
-  /** Base URL for calls that do not pass one explicitly. */
-  baseUrl?: string;
-  /** Minimum spacing between outbound requests. */
-  minIntervalMs?: number;
-  /** Attempts per URL, including the first. */
-  maxRetries?: number;
-  /** First backoff, doubled on each subsequent attempt. */
-  baseBackoffMs?: number;
-  /** Abort a request that takes longer than this. */
-  requestTimeoutMs?: number;
-  metrics?: ThrottleMetrics;
-  logger?: HorizonLogSink;
-  /** Injectable for tests; defaults to `globalThis.fetch` resolved at call time. */
-  fetchImpl?: typeof fetch;
-  /** Injectable for tests; defaults to `setTimeout`. */
-  sleep?: (ms: number) => Promise<void>;
+export interface HorizonLogger {
+  info?(meta: Record<string, unknown>, msg: string): void;
+  warn(meta: Record<string, unknown>, msg: string): void;
 }
 
 /**
- * Every method takes the base URL of the network it is asking about, because a
- * deployment serves more than one chain: falling back to the primary network's
- * Horizon when the database has nothing for testnet would hand a client mainnet
- * data under a testnet label. Calls that omit it use `baseUrl` from the options,
- * which is the single-network deployment's default.
+ * Error thrown when a Horizon response payload is missing a required field or
+ * has a field of the wrong runtime type. Retains the offending `field` path,
+ * request `url`, and `rawResponse` body so callers and logs can diagnose the
+ * exact payload that failed validation before it reaches database writes.
  */
-export interface HorizonClient {
-  getLatestLedgerSequence(baseUrl?: string): Promise<number>;
-  getLedger(sequence: number, baseUrl?: string): Promise<HorizonLedger>;
-  getLedgerTransactions(sequence: number, baseUrl?: string): Promise<HorizonTransaction[]>;
-  getLedgerOperations(sequence: number, baseUrl?: string): Promise<HorizonOperation[]>;
-  getAccount(address: string, baseUrl?: string): Promise<HorizonAccount | null>;
-  getRecentTransactions(limit?: number, baseUrl?: string): Promise<HorizonTransaction[]>;
-  getAccountTransactions(
-    address: string,
-    limit?: number,
-    baseUrl?: string
-  ): Promise<HorizonTransaction[]>;
-  getLatestLedger(baseUrl?: string): Promise<HorizonLatestLedger | null>;
-  getTrades(params?: HorizonTradesFilter, baseUrl?: string): Promise<HorizonTrade[]>;
+export class HorizonValidationError extends Error {
+  readonly field: string;
+  readonly url: string;
+  readonly rawResponse: unknown;
+
+  constructor(field: string, reason: string, rawResponse: unknown, url = '') {
+    const location = url ? ` from ${url}` : '';
+    super(`Malformed Horizon response${location}: invalid or missing field "${field}" (${reason})`);
+    this.name = 'HorizonValidationError';
+    this.field = field;
+    this.url = url;
+    this.rawResponse = rawResponse;
+  }
 }
 
-const DEFAULT_MIN_INTERVAL_MS = 100;
-const DEFAULT_MAX_RETRIES = 3;
-const DEFAULT_BASE_BACKOFF_MS = 300;
-/** Generous by default: a 200-record ledger page is not a small response. */
-const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
-export function createHorizonClient(options: HorizonClientOptions = {}): HorizonClient {
-  const name = options.name ?? 'horizon';
-  const defaultBaseUrl = options.baseUrl;
-  const maxRetries = Math.max(1, options.maxRetries ?? DEFAULT_MAX_RETRIES);
-  const baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
-  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const metrics = options.metrics;
-  const log = options.logger;
-  const sleep =
-    options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
-  // Resolved per call rather than captured, so a test that replaces the global
-  // still exercises the same client the service built at startup.
-  const doFetch: typeof fetch = options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
-  // Pacing only: this client reports its own metrics, per request attempt,
-  // because a retried 429 must show up as two requests and not one.
-  const { throttle } = createThrottle({
-    name,
-    minIntervalMs: options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS,
-  });
+function requireObject(
+  value: unknown,
+  field: string,
+  rawResponse: unknown,
+  url: string
+): Record<string, unknown> {
+  if (!isObjectRecord(value)) {
+    throw new HorizonValidationError(
+      field,
+      `expected object, got ${value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value}`,
+      rawResponse,
+      url
+    );
+  }
+  return value;
+}
 
-  const backoffMs = (attempt: number) => baseBackoffMs * 2 ** (attempt - 1);
+function requireString(
+  obj: Record<string, unknown>,
+  key: string,
+  prefix: string,
+  rawResponse: unknown,
+  url: string
+): string {
+  const path = prefix ? `${prefix}.${key}` : key;
+  const val = obj[key];
+  if (typeof val !== 'string' || val.length === 0) {
+    throw new HorizonValidationError(
+      path,
+      val === undefined
+        ? 'required string is missing'
+        : `expected non-empty string, got ${val === null ? 'null' : typeof val}`,
+      rawResponse,
+      url
+    );
+  }
+  return val;
+}
 
-  function url(path: string, baseUrl?: string): string {
-    const base = baseUrl ?? defaultBaseUrl;
-    if (!base) throw new Error(`${name} client has no base URL: pass one or configure baseUrl`);
-    return `${base.replace(/\/+$/, '')}${path}`;
+function requireNumber(
+  obj: Record<string, unknown>,
+  key: string,
+  prefix: string,
+  rawResponse: unknown,
+  url: string
+): number {
+  const path = prefix ? `${prefix}.${key}` : key;
+  const val = obj[key];
+  if (typeof val !== 'number' || !Number.isFinite(val)) {
+    throw new HorizonValidationError(
+      path,
+      val === undefined
+        ? 'required number is missing'
+        : `expected finite number, got ${val === null ? 'null' : typeof val}`,
+      rawResponse,
+      url
+    );
+  }
+  return val;
+}
+
+function requireBoolean(
+  obj: Record<string, unknown>,
+  key: string,
+  prefix: string,
+  rawResponse: unknown,
+  url: string
+): boolean {
+  const path = prefix ? `${prefix}.${key}` : key;
+  const val = obj[key];
+  if (typeof val !== 'boolean') {
+    throw new HorizonValidationError(
+      path,
+      val === undefined
+        ? 'required boolean is missing'
+        : `expected boolean, got ${val === null ? 'null' : typeof val}`,
+      rawResponse,
+      url
+    );
+  }
+  return val;
+}
+
+/**
+ * Validates a Horizon ledger summary (`HorizonLatestLedger`).
+ */
+export function validateHorizonLatestLedger(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonLatestLedger {
+  const obj = requireObject(raw, prefix || 'ledger', rootRaw, url);
+  requireNumber(obj, 'sequence', prefix, rootRaw, url);
+  requireString(obj, 'closed_at', prefix, rootRaw, url);
+  requireNumber(obj, 'successful_transaction_count', prefix, rootRaw, url);
+  requireNumber(obj, 'failed_transaction_count', prefix, rootRaw, url);
+  requireNumber(obj, 'operation_count', prefix, rootRaw, url);
+  return obj as unknown as HorizonLatestLedger;
+}
+
+/**
+ * Validates a full Horizon ledger record (`HorizonLedger`).
+ */
+export function validateHorizonLedger(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonLedger {
+  const obj = requireObject(raw, prefix || 'ledger', rootRaw, url);
+  validateHorizonLatestLedger(obj, url, prefix, rootRaw);
+  requireNumber(obj, 'base_fee_in_stroops', prefix, rootRaw, url);
+  requireNumber(obj, 'base_reserve_in_stroops', prefix, rootRaw, url);
+  return obj as unknown as HorizonLedger;
+}
+
+/**
+ * Validates a Horizon transaction record (`HorizonTransaction`).
+ */
+export function validateHorizonTransaction(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonTransaction {
+  const obj = requireObject(raw, prefix || 'transaction', rootRaw, url);
+  requireString(obj, 'hash', prefix, rootRaw, url);
+  requireNumber(obj, 'ledger', prefix, rootRaw, url);
+  requireString(obj, 'created_at', prefix, rootRaw, url);
+  requireString(obj, 'source_account', prefix, rootRaw, url);
+  requireString(obj, 'fee_charged', prefix, rootRaw, url);
+  requireNumber(obj, 'operation_count', prefix, rootRaw, url);
+  requireBoolean(obj, 'successful', prefix, rootRaw, url);
+  requireString(obj, 'memo_type', prefix, rootRaw, url);
+  if (obj['memo'] !== undefined && obj['memo'] !== null && typeof obj['memo'] !== 'string') {
+    const path = prefix ? `${prefix}.memo` : 'memo';
+    throw new HorizonValidationError(path, `expected string, got ${typeof obj['memo']}`, rootRaw, url);
+  }
+  return obj as unknown as HorizonTransaction;
+}
+
+/**
+ * Validates a Horizon operation record (`HorizonOperation`).
+ */
+export function validateHorizonOperation(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonOperation {
+  const obj = requireObject(raw, prefix || 'operation', rootRaw, url);
+  requireString(obj, 'id', prefix, rootRaw, url);
+  requireString(obj, 'type', prefix, rootRaw, url);
+  requireString(obj, 'transaction_hash', prefix, rootRaw, url);
+  requireString(obj, 'created_at', prefix, rootRaw, url);
+  requireString(obj, 'source_account', prefix, rootRaw, url);
+  return obj as unknown as HorizonOperation;
+}
+
+/**
+ * Validates a Horizon account record (`HorizonAccount`).
+ */
+export function validateHorizonAccount(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonAccount {
+  const obj = requireObject(raw, prefix || 'account', rootRaw, url);
+
+  // Horizon uses `account_id`, while some callers/mocks may provide `id`.
+  const accountId = obj['account_id'] ?? obj['id'];
+  const idPath = prefix ? `${prefix}.account_id` : 'account_id';
+  if (typeof accountId !== 'string' || accountId.length === 0) {
+    throw new HorizonValidationError(
+      idPath,
+      accountId === undefined
+        ? 'required string is missing'
+        : `expected non-empty string, got ${accountId === null ? 'null' : typeof accountId}`,
+      rootRaw,
+      url
+    );
+  }
+  requireString(obj, 'sequence', prefix, rootRaw, url);
+  requireNumber(obj, 'subentry_count', prefix, rootRaw, url);
+  requireNumber(obj, 'last_modified_ledger', prefix, rootRaw, url);
+  requireNumber(obj, 'num_sponsored', prefix, rootRaw, url);
+  requireNumber(obj, 'num_sponsoring', prefix, rootRaw, url);
+
+  const balancesPath = prefix ? `${prefix}.balances` : 'balances';
+  const balances = obj['balances'];
+  if (!Array.isArray(balances)) {
+    throw new HorizonValidationError(
+      balancesPath,
+      balances === undefined
+        ? 'required array is missing'
+        : `expected array, got ${balances === null ? 'null' : typeof balances}`,
+      rootRaw,
+      url
+    );
+  }
+  for (let i = 0; i < balances.length; i++) {
+    const itemPrefix = `${balancesPath}[${i}]`;
+    const bal = requireObject(balances[i], itemPrefix, rootRaw, url);
+    requireString(bal, 'balance', itemPrefix, rootRaw, url);
+    requireString(bal, 'asset_type', itemPrefix, rootRaw, url);
   }
 
-  /**
-   * Both call styles, one pipeline.
-   *
-   * `throw` is for the indexer, whose ledger walk must not silently index
-   * nothing; `null` is for the GraphQL server's read-through fallback, where a
-   * Horizon outage has to degrade to "not indexed yet" rather than fail the
-   * query. A 404 is a statement about the ledger or account, not a failure, so
-   * neither style retries it.
-   */
-  async function request<T>(target: string, mode: 'throw'): Promise<T>;
-  async function request<T>(target: string, mode: 'null'): Promise<T | null>;
-  async function request<T>(target: string, mode: 'throw' | 'null'): Promise<T | null> {
-    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-      await throttle();
+  const flagsPath = prefix ? `${prefix}.flags` : 'flags';
+  const flags = requireObject(obj['flags'], flagsPath, rootRaw, url);
+  requireBoolean(flags, 'auth_required', flagsPath, rootRaw, url);
+  requireBoolean(flags, 'auth_revocable', flagsPath, rootRaw, url);
+  requireBoolean(flags, 'auth_immutable', flagsPath, rootRaw, url);
+  requireBoolean(flags, 'auth_clawback_enabled', flagsPath, rootRaw, url);
 
-      const stopTimer = metrics?.requestDuration?.startTimer();
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const thresholdsPath = prefix ? `${prefix}.thresholds` : 'thresholds';
+  const thresholds = requireObject(obj['thresholds'], thresholdsPath, rootRaw, url);
+  requireNumber(thresholds, 'low_threshold', thresholdsPath, rootRaw, url);
+  requireNumber(thresholds, 'med_threshold', thresholdsPath, rootRaw, url);
+  requireNumber(thresholds, 'high_threshold', thresholdsPath, rootRaw, url);
 
-      let res: Response;
-      try {
-        res = await doFetch(target, { signal: controller.signal });
-      } catch (err) {
-        clearTimeout(timeout);
-        stopTimer?.();
-        metrics?.requestsTotal.inc({ status: 'error' });
+  if (obj['account_id'] === undefined) {
+    return { ...obj, account_id: accountId } as unknown as HorizonAccount;
+  }
+  return obj as unknown as HorizonAccount;
+}
 
-        if (attempt < maxRetries) {
-          await sleep(backoffMs(attempt));
-          continue;
-        }
-        log?.warn({ url: target, attempts: attempt }, `${name} request failed to connect`);
-        if (mode === 'throw') throw err;
-        return null;
-      }
-      clearTimeout(timeout);
-      stopTimer?.();
-      metrics?.requestsTotal.inc({ status: String(res.status) });
+/**
+ * Validates a Horizon trade record (`HorizonTrade`).
+ */
+export function validateHorizonTrade(
+  raw: unknown,
+  url = '',
+  prefix = '',
+  rootRaw: unknown = raw
+): HorizonTrade {
+  const obj = requireObject(raw, prefix || 'trade', rootRaw, url);
+  requireString(obj, 'id', prefix, rootRaw, url);
+  requireString(obj, 'paging_token', prefix, rootRaw, url);
+  requireString(obj, 'ledger_close_time', prefix, rootRaw, url);
+  requireString(obj, 'base_account', prefix, rootRaw, url);
+  requireString(obj, 'base_amount', prefix, rootRaw, url);
+  requireString(obj, 'base_asset_type', prefix, rootRaw, url);
+  requireString(obj, 'counter_amount', prefix, rootRaw, url);
+  requireString(obj, 'counter_asset_type', prefix, rootRaw, url);
+  return obj as unknown as HorizonTrade;
+}
 
-      if (res.ok) return (await res.json()) as T;
-
-      if (res.status === 404 && mode === 'null') return null;
-
-      if (res.status === 429 && attempt < maxRetries) {
-        const retryAfter = res.headers?.get?.('Retry-After') ?? null;
-        const parsed = retryAfter === null ? Number.NaN : Number(retryAfter);
-        // A `Retry-After` that is not a number of seconds (an HTTP date, a
-        // proxy's placeholder) is worse than no header at all: obeying it as
-        // `NaN` waits zero milliseconds and turns a rate limit into a burst.
-        const delay = Number.isFinite(parsed) && parsed > 0 ? parsed * 1000 : backoffMs(attempt);
-        log?.warn({ url: target, attempt, delay }, `${name} rate limit, retrying after a pause`);
-        await sleep(delay);
-        continue;
-      }
-
-      if (mode === 'throw') {
-        throw new Error(`${name} request failed (${res.status}): ${target}`);
-      }
-      log?.warn({ url: target, status: res.status }, `${name} request failed`);
-      return null;
-    }
-
-    // Unreachable: `maxRetries` is clamped to at least one attempt, and every
-    // path above either returns or throws. Present so the return type is honest.
-    return null;
+/**
+ * Validates a paginated Horizon `_embedded.records` envelope and each record within it.
+ */
+export function validateHorizonPage<T>(
+  raw: unknown,
+  validateRecord: (record: unknown, url: string, prefix: string, rootRaw: unknown) => T,
+  url = ''
+): HorizonPage<T> {
+  const obj = requireObject(raw, 'response', raw, url);
+  const embedded = requireObject(obj['_embedded'], '_embedded', raw, url);
+  const records = embedded['records'];
+  if (!Array.isArray(records)) {
+    throw new HorizonValidationError(
+      '_embedded.records',
+      records === undefined
+        ? 'required array is missing'
+        : `expected array, got ${records === null ? 'null' : typeof records}`,
+      raw,
+      url
+    );
   }
 
-  async function fetchAllPages<T>(target: string): Promise<T[]> {
-    const records: T[] = [];
-    let next: string | undefined = target;
-    while (next) {
-      // Annotated rather than inferred: `next` is reassigned from `page` below,
-      // and the two would otherwise be circular.
-      const page: HorizonPage<T> = await request<HorizonPage<T>>(next, 'throw');
-      records.push(...page._embedded.records);
-      next = page._embedded.records.length === PAGE_LIMIT ? page._links.next?.href : undefined;
+  const validatedRecords: T[] = [];
+  for (let i = 0; i < records.length; i++) {
+    validatedRecords.push(validateRecord(records[i], url, `_embedded.records[${i}]`, raw));
+  }
+
+  if (obj['_links'] !== undefined && obj['_links'] !== null) {
+    const links = requireObject(obj['_links'], '_links', raw, url);
+    if (links['next'] !== undefined && links['next'] !== null) {
+      const next = requireObject(links['next'], '_links.next', raw, url);
+      requireString(next, 'href', '_links.next', raw, url);
     }
-    return records;
   }
 
   return {
-    async getLatestLedgerSequence(baseUrl?: string): Promise<number> {
-      const page = await request<HorizonPage<HorizonLedger>>(
-        url('/ledgers?order=desc&limit=1', baseUrl),
-        'throw'
+    ...(obj as Record<string, unknown>),
+    _embedded: {
+      ...embedded,
+      records: validatedRecords,
+    },
+  } as HorizonPage<T>;
+}
+
+export interface HorizonClientOptions {
+  /** Metric/error label for the throttle (default: `'horizon'`). */
+  name?: string;
+  /** Default Horizon base URL when a call does not pass one. */
+  baseUrl?: string;
+  /** Minimum spacing in ms between outbound requests (default: `100`). */
+  minIntervalMs?: number;
+  /** Maximum spacing in ms during adaptive rate-limit backoff (default: `10000`). */
+  maxIntervalMs?: number;
+  /** Optional bearer token for authenticated Horizon providers. */
+  authToken?: string;
+  /** Weight factor for backfill vs tip traffic (default: `2`). */
+  tipWeightFactor?: number;
+  /** Maximum retry attempts for retryable calls (default: `3`). */
+  maxRetries?: number;
+  /** Base backoff in ms for retryable calls (default: `300`). */
+  baseBackoffMs?: number;
+  /** Per-request timeout in ms for resilient calls when > 0 (default: `0`, disabled). */
+  requestTimeoutMs?: number;
+  /** Optional Prometheus metrics hooks. */
+  metrics?: ThrottleMetrics;
+  /** Optional structured logger for retry/timeout/validation warnings. */
+  logger?: HorizonLogger;
+  /** Optional fetch implementation override for testing. */
+  fetchFn?: typeof fetch;
+  /**
+   * When true, `getAccount` returns `null` after exhausting retries on transient
+   * HTTP/network errors instead of throwing (used by GraphQL fallback mode so
+   * resolvers degrade gracefully, while the indexer throws so queued refreshes
+   * are deferred and retried).
+   */
+  swallowAccountErrors?: boolean;
+}
+
+export interface HorizonClient {
+  throttle(purpose?: RequestPurpose): Promise<void>;
+  fetchJson<T>(url: string, init?: RequestInit, purpose?: RequestPurpose): Promise<T>;
+  getLatestLedgerSequence(baseUrl?: string, purpose?: RequestPurpose): Promise<number>;
+  getLedger(sequence: number, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonLedger>;
+  getLedgerTransactions(sequence: number, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonTransaction[]>;
+  getLedgerOperations(sequence: number, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonOperation[]>;
+  getAccount(address: string, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonAccount | null>;
+  getRecentTransactions(limit?: number, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonTransaction[]>;
+  getAccountTransactions(
+    address: string,
+    limit?: number,
+    baseUrl?: string,
+    purpose?: RequestPurpose
+  ): Promise<HorizonTransaction[]>;
+  getLatestLedger(baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonLatestLedger | null>;
+  getTrades(params?: HorizonTradesFilter, baseUrl?: string, purpose?: RequestPurpose): Promise<HorizonTrade[]>;
+}
+
+/**
+ * Resolve a `next` link returned by Horizon against the configured base URL.
+ *
+ * Horizon constructs `_links.next.href` from its own `PUBLIC_HORIZON_URL` /
+ * `Host` header, which behind a reverse proxy or port-forwarded container is
+ * often an internal hostname (`http://horizon:8000/...`) or `localhost` that
+ * the caller cannot reach. Keeping the path + query string from `next` while
+ * anchoring the origin (and any base-path prefix) to `baseUrl` ensures every
+ * follow-up page goes through the same endpoint that served page 1.
+ */
+function resolveNextUrl(baseUrl: string, nextHref: string): string {
+  try {
+    const base = new URL(baseUrl);
+    const next = new URL(nextHref, base);
+    next.protocol = base.protocol;
+    next.host = base.host;
+    return next.toString();
+  } catch {
+    return nextHref;
+  }
+}
+
+export function createHorizonClient(options: HorizonClientOptions = {}): HorizonClient {
+  const {
+    name = 'horizon',
+    baseUrl: defaultBaseUrl = 'https://horizon.stellar.org',
+    minIntervalMs = 100,
+    maxIntervalMs = 10000,
+    authToken,
+    tipWeightFactor = 2,
+    maxRetries = 3,
+    baseBackoffMs = 300,
+    requestTimeoutMs = 0,
+    metrics,
+    logger,
+    fetchFn,
+    swallowAccountErrors = false,
+  } = options;
+
+  const { throttle, fetchJson } = createThrottle({
+    name,
+    minIntervalMs,
+    maxIntervalMs,
+    authToken,
+    tipWeightFactor,
+    metrics,
+  });
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+  const doFetch: typeof fetch =
+    fetchFn ?? ((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init));
+
+  function resolveBase(baseUrl?: string): string {
+    return (baseUrl ?? defaultBaseUrl).replace(/\/+$/, '');
+  }
+
+  function validateWithDiagnostics<T>(url: string, raw: unknown, validate: () => T): T {
+    try {
+      return validate();
+    } catch (err) {
+      if (err instanceof HorizonValidationError) {
+        logger?.warn(
+          { url, field: err.field, rawResponse: err.rawResponse },
+          err.message
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Fetch all records across paginated Horizon responses.
+   * Follows `_links.next.href` while pages are full (`records.length === PAGE_LIMIT`).
+   */
+  async function fetchAllPages<T>(
+    baseUrl: string,
+    initialUrl: string,
+    validateRecord: (record: unknown, url: string, prefix: string, rootRaw: unknown) => T,
+    purpose: RequestPurpose = 'default'
+  ): Promise<T[]> {
+    const all: T[] = [];
+    let url: string | undefined = initialUrl;
+
+    while (url) {
+      const currentUrl: string = url;
+      const raw: unknown = await fetchJson<unknown>(currentUrl, undefined, purpose);
+      const page: HorizonPage<T> = validateWithDiagnostics(
+        currentUrl,
+        raw,
+        (): HorizonPage<T> => validateHorizonPage(raw, validateRecord, currentUrl)
+      );
+      const records: T[] = page._embedded.records;
+      all.push(...records);
+
+      const nextHref: string | undefined = page._links?.next?.href;
+      url = records.length === PAGE_LIMIT && nextHref ? resolveNextUrl(baseUrl, nextHref) : undefined;
+    }
+
+    return all;
+  }
+
+  /**
+   * Resilient GET helper used for fallback / single-resource queries where
+   * 404 is an expected "not found" result and 429 / transient failures retry
+   * before either returning `null` or throwing.
+   */
+  async function fetchWithRetry(
+    url: string,
+    throwOnError = false,
+    purpose: RequestPurpose = 'default'
+  ): Promise<unknown | null> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      await throttle(purpose);
+      const stopTimer = metrics?.requestDuration?.startTimer();
+      const controller = requestTimeoutMs > 0 ? new AbortController() : undefined;
+      const timeout =
+        requestTimeoutMs > 0 ? setTimeout(() => controller!.abort(), requestTimeoutMs) : undefined;
+      let res: Response;
+      try {
+        res = await doFetch(url, controller ? { signal: controller.signal } : undefined);
+      } catch (err) {
+        if (timeout !== undefined) clearTimeout(timeout);
+        metrics?.requestsTotal.inc({ status: 'error' });
+        stopTimer?.();
+        if (attempt < maxRetries) {
+          await sleep(baseBackoffMs * attempt);
+          continue;
+        }
+        logger?.warn({ url, attempts: maxRetries }, 'horizon request failed to connect');
+        if (throwOnError) throw err;
+        return null;
+      }
+      if (timeout !== undefined) clearTimeout(timeout);
+      stopTimer?.();
+      metrics?.requestsTotal.inc({ status: String(res.status) });
+
+      if (res.status === 404) return null;
+
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers?.get?.('Retry-After'));
+        const delay =
+          Number.isFinite(retryAfter) && retryAfter >= 0
+            ? retryAfter * 1000
+            : baseBackoffMs * attempt;
+        if (attempt < maxRetries) {
+          logger?.warn({ url, attempt, delay }, 'horizon rate limit, retrying after a pause');
+          await sleep(delay);
+          continue;
+        }
+        logger?.warn({ url, attempts: maxRetries }, 'horizon rate limit, giving up');
+        if (throwOnError) {
+          throw new Error(`${name} request failed with status 429: ${url}`);
+        }
+        return null;
+      }
+
+      if (!res.ok) {
+        if (attempt < maxRetries && res.status >= 500) {
+          await sleep(baseBackoffMs * attempt);
+          continue;
+        }
+        logger?.warn({ url, status: res.status }, 'horizon returned non-ok status');
+        if (throwOnError) {
+          throw new Error(`${name} request failed with status ${res.status}: ${url}`);
+        }
+        return null;
+      }
+
+      return await res.json();
+    }
+    return null;
+  }
+
+  return {
+    throttle,
+    fetchJson,
+
+    async getLatestLedgerSequence(baseUrl?: string, purpose: RequestPurpose = 'tip'): Promise<number> {
+      const base = resolveBase(baseUrl);
+      const url = `${base}/ledgers?order=desc&limit=1`;
+      const raw = await fetchJson<unknown>(url, undefined, purpose);
+      const page = validateWithDiagnostics(url, raw, () =>
+        validateHorizonPage(raw, validateHorizonLatestLedger, url)
       );
       return page._embedded.records[0]?.sequence ?? 0;
     },
 
-    getLedger(sequence: number, baseUrl?: string): Promise<HorizonLedger> {
-      return request<HorizonLedger>(url(`/ledgers/${sequence}`, baseUrl), 'throw');
+    async getLedger(sequence: number, baseUrl?: string, purpose: RequestPurpose = 'default'): Promise<HorizonLedger> {
+      const base = resolveBase(baseUrl);
+      const url = `${base}/ledgers/${sequence}`;
+      const raw = await fetchJson<unknown>(url, undefined, purpose);
+      return validateWithDiagnostics(url, raw, () => validateHorizonLedger(raw, url));
     },
 
-    getLedgerTransactions(sequence: number, baseUrl?: string): Promise<HorizonTransaction[]> {
+    getLedgerTransactions(
+      sequence: number,
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
+    ): Promise<HorizonTransaction[]> {
+      const base = resolveBase(baseUrl);
       return fetchAllPages<HorizonTransaction>(
-        url(`/ledgers/${sequence}/transactions?order=asc&limit=${PAGE_LIMIT}`, baseUrl)
+        base,
+        `${base}/ledgers/${sequence}/transactions?order=asc&limit=${PAGE_LIMIT}`,
+        validateHorizonTransaction,
+        purpose
       );
     },
 
-    getLedgerOperations(sequence: number, baseUrl?: string): Promise<HorizonOperation[]> {
+    getLedgerOperations(
+      sequence: number,
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
+    ): Promise<HorizonOperation[]> {
+      const base = resolveBase(baseUrl);
       return fetchAllPages<HorizonOperation>(
-        url(`/ledgers/${sequence}/operations?order=asc&limit=${PAGE_LIMIT}`, baseUrl)
+        base,
+        `${base}/ledgers/${sequence}/operations?order=asc&limit=${PAGE_LIMIT}`,
+        validateHorizonOperation,
+        purpose
       );
     },
 
-    /** `null` rather than an exception for accounts that don't exist or were merged away. */
-    getAccount(address: string, baseUrl?: string): Promise<HorizonAccount | null> {
-      return request<HorizonAccount>(url(`/accounts/${address}`, baseUrl), 'null');
+    async getAccount(
+      address: string,
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
+    ): Promise<HorizonAccount | null> {
+      const base = resolveBase(baseUrl);
+      const url = `${base}/accounts/${address}`;
+      const raw = await fetchWithRetry(url, !swallowAccountErrors, purpose);
+      if (raw === null) return null;
+      return validateWithDiagnostics(url, raw, () => validateHorizonAccount(raw, url));
     },
 
-    async getRecentTransactions(limit = 20, baseUrl?: string): Promise<HorizonTransaction[]> {
-      const page = await request<HorizonPage<HorizonTransaction>>(
-        url(`/transactions?order=desc&limit=${limit}`, baseUrl),
-        'null'
+    async getRecentTransactions(
+      limit = 20,
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
+    ): Promise<HorizonTransaction[]> {
+      const base = resolveBase(baseUrl);
+      const url = `${base}/transactions?limit=${limit}&order=desc`;
+      const raw = await fetchWithRetry(url, false, purpose);
+      if (raw === null) return [];
+      const page = validateWithDiagnostics(url, raw, () =>
+        validateHorizonPage(raw, validateHorizonTransaction, url)
       );
-      return page?._embedded?.records ?? [];
+      return page._embedded.records;
     },
 
     async getAccountTransactions(
       address: string,
       limit = 10,
-      baseUrl?: string
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
     ): Promise<HorizonTransaction[]> {
-      const page = await request<HorizonPage<HorizonTransaction>>(
-        url(`/accounts/${address}/transactions?order=desc&limit=${limit}`, baseUrl),
-        'null'
+      const base = resolveBase(baseUrl);
+      const url = `${base}/accounts/${address}/transactions?limit=${limit}&order=desc`;
+      const raw = await fetchWithRetry(url, false, purpose);
+      if (raw === null) return [];
+      const page = validateWithDiagnostics(url, raw, () =>
+        validateHorizonPage(raw, validateHorizonTransaction, url)
       );
-      return page?._embedded?.records ?? [];
+      return page._embedded.records;
     },
 
-    async getLatestLedger(baseUrl?: string): Promise<HorizonLatestLedger | null> {
-      const page = await request<HorizonPage<HorizonLatestLedger>>(
-        url('/ledgers?order=desc&limit=1', baseUrl),
-        'null'
+    async getLatestLedger(
+      baseUrl?: string,
+      purpose: RequestPurpose = 'tip'
+    ): Promise<HorizonLatestLedger | null> {
+      const base = resolveBase(baseUrl);
+      const url = `${base}/ledgers?limit=1&order=desc`;
+      const raw = await fetchWithRetry(url, false, purpose);
+      if (raw === null) return null;
+      const page = validateWithDiagnostics(url, raw, () =>
+        validateHorizonPage(raw, validateHorizonLatestLedger, url)
       );
-      return page?._embedded?.records?.[0] ?? null;
+      return page._embedded.records[0] ?? null;
     },
 
-    async getTrades(params: HorizonTradesFilter = {}, baseUrl?: string): Promise<HorizonTrade[]> {
-      const q = new URLSearchParams();
-      if (params.cursor) q.set('cursor', params.cursor);
-      if (params.order) q.set('order', params.order);
-      if (params.limit) q.set('limit', String(params.limit));
-      if (params.base_asset_type) q.set('base_asset_type', params.base_asset_type);
-      if (params.base_asset_code) q.set('base_asset_code', params.base_asset_code);
-      if (params.base_asset_issuer) q.set('base_asset_issuer', params.base_asset_issuer);
-      if (params.counter_asset_type) q.set('counter_asset_type', params.counter_asset_type);
-      if (params.counter_asset_code) q.set('counter_asset_code', params.counter_asset_code);
-      if (params.counter_asset_issuer) q.set('counter_asset_issuer', params.counter_asset_issuer);
-      if (params.offer_id) q.set('offer_id', params.offer_id);
-      const qs = q.toString();
-      const path = `/trades${qs ? `?${qs}` : ''}`;
-      const page = await request<HorizonPage<HorizonTrade>>(url(path, baseUrl), 'null');
-      return page?._embedded?.records ?? [];
+    async getTrades(
+      params: HorizonTradesFilter = {},
+      baseUrl?: string,
+      purpose: RequestPurpose = 'default'
+    ): Promise<HorizonTrade[]> {
+      const base = resolveBase(baseUrl);
+      const query = new URLSearchParams();
+      query.set('order', params.order ?? 'asc');
+      query.set('limit', String(params.limit ?? PAGE_LIMIT));
+      if (params.cursor) query.set('cursor', params.cursor);
+      if (params.offerId) query.set('offer_id', params.offerId);
+      if (params.baseAssetType) query.set('base_asset_type', params.baseAssetType);
+      if (params.baseAssetCode) query.set('base_asset_code', params.baseAssetCode);
+      if (params.baseAssetIssuer) query.set('base_asset_issuer', params.baseAssetIssuer);
+      if (params.counterAssetType) query.set('counter_asset_type', params.counterAssetType);
+      if (params.counterAssetCode) query.set('counter_asset_code', params.counterAssetCode);
+      if (params.counterAssetIssuer) query.set('counter_asset_issuer', params.counterAssetIssuer);
+
+      const path = params.accountId
+        ? `${base}/accounts/${encodeURIComponent(params.accountId)}/trades`
+        : `${base}/trades`;
+      const url = `${path}?${query.toString()}`;
+      const raw = await fetchJson<unknown>(url, undefined, purpose);
+      const page = validateWithDiagnostics(url, raw, () =>
+        validateHorizonPage(raw, validateHorizonTrade, url)
+      );
+      return page._embedded.records;
     },
   };
 }

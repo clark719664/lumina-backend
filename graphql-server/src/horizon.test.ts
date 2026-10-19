@@ -27,12 +27,32 @@ test('getAccount returns null immediately on 404, without retrying', async () =>
 });
 
 test('getAccount retries on 429 and succeeds once the rate limit clears', async () => {
+  const validAccount = {
+    account_id: 'GABC',
+    sequence: '1',
+    subentry_count: 0,
+    last_modified_ledger: 100,
+    num_sponsored: 0,
+    num_sponsoring: 0,
+    balances: [],
+    flags: {
+      auth_required: false,
+      auth_revocable: false,
+      auth_immutable: false,
+      auth_clawback_enabled: false,
+    },
+    thresholds: {
+      low_threshold: 0,
+      med_threshold: 0,
+      high_threshold: 0,
+    },
+  };
   mockFetchSequence([
     { status: 429, headers: { 'Retry-After': '0' } },
-    { status: 200, body: { account_id: 'GABC', sequence: '1' } },
+    { status: 200, body: validAccount },
   ]);
   const result = await getAccount('GABC');
-  assert.deepEqual(result, { account_id: 'GABC', sequence: '1' });
+  assert.deepEqual(result, validAccount);
 });
 
 test('getAccount gives up and returns null after exhausting retries on repeated 429s', async () => {

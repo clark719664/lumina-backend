@@ -17,6 +17,8 @@ import {
   createHorizonClient,
   type HorizonAccount,
   type HorizonLatestLedger,
+  type HorizonTrade,
+  type HorizonTradesFilter,
   type HorizonTransaction,
 } from '@lumina/shared';
 import { horizonRequestDuration, horizonRequests } from './metrics';
@@ -47,6 +49,7 @@ const client = createHorizonClient({
   requestTimeoutMs: REQUEST_TIMEOUT_MS,
   metrics: { requestsTotal: horizonRequests, requestDuration: horizonRequestDuration },
   logger: subsystem('horizon'),
+  swallowAccountErrors: true,
 });
 
 export function getRecentTransactions(

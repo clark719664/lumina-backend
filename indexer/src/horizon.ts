@@ -1,37 +1,23 @@
 /**
- * The indexer's Horizon client.
+ * Stellar Horizon API client for the indexer.
  *
- * The implementation lives in `@lumina/shared` so this service and the GraphQL
- * server cannot drift apart again — the server's copy had no throttle, so the
- * service with the smaller request budget was the one being rate-limited. What
- * stays here is what is specific to the indexer: its metrics registry, its log
- * sink and its pacing knobs.
+ * Thin wrapper around `@lumina/shared`'s `createHorizonClient` wired up to the
+ * indexer's Prometheus metrics (`horizonRequests`, `horizonRequestDuration`),
+ * adaptive rate-limiting metrics, and structured subsystem logger.
  *
- * The signatures are unchanged (a Horizon base URL as the first argument), so no
- * call site and no test had to move, and the suite in `horizon.test.ts` now
- * exercises the shared client.
- *
- * ## Tuning constants
- *
- * - `PAGE_LIMIT` (200) — Horizon's maximum records-per-page. A full page is also
- *   the signal that another page exists: the shared client follows `next` links
- *   only when the current page is exactly this size, so a short final page stops
- *   pagination without a second round-trip.
- * - `REQUEST_TIMEOUT_MS` (10 s, overridable via `HORIZON_REQUEST_TIMEOUT_MS`) —
- *   generous by default because a 200-record ledger page is not a small response.
- *   An indexer that hangs on a wedged Horizon is worse than one that retries.
- * - `ACCOUNT_REQUEST_TIMEOUT_MS` (10 s) — reserved for account-fetch paths that
- *   may need a longer window; the shared client's own timeout applies today.
+ * Every function takes the network's `horizonUrl` explicitly so multi-network
+ * indexing loops (`resolveNetworks`) can poll independent Horizon endpoints in
+ * the same process while sharing the per-IP outbound request throttle.
  */
 import {
   createHorizonClient,
   type HorizonAccount,
   type HorizonLedger,
   type HorizonOperation,
-  type HorizonTransaction,
   type HorizonTrade,
-  type HorizonTradePrice,
   type HorizonTradesFilter,
+  type HorizonTransaction,
+  type RequestPurpose,
 } from '@lumina/shared';
 import {
   horizonRequestDuration,
@@ -42,99 +28,61 @@ import {
 } from './metrics';
 import { subsystem } from './logger';
 
-/**
- * Horizon's maximum records per page, and the signal that another page exists.
- * Re-exported from the shared client so the indexer and tests reference one
- * constant.
- */
-export const PAGE_LIMIT = 200;
-
-/** Reserved timeout for account-fetch paths (10 s). */
-const ACCOUNT_REQUEST_TIMEOUT_MS = 10_000;
-
-export interface HorizonLedger {
-  sequence: number;
-  closed_at: string;
-  successful_transaction_count: number;
-  failed_transaction_count: number;
-  operation_count: number;
-  base_fee_in_stroops: number;
-  base_reserve_in_stroops: number;
-}
-
-export interface HorizonTransaction {
-  hash: string;
-  ledger: number;
-  created_at: string;
-  source_account: string;
-  fee_charged: string;
-  operation_count: number;
-  successful: boolean;
-  memo_type: string;
-  memo?: string;
-}
-
-export interface HorizonOperation {
-  id: string;
-  type: string;
-  transaction_hash: string;
-  created_at: string;
-  source_account: string;
-  [key: string]: unknown;
-}
-
-export interface HorizonBalance {
-  asset_type: string;
-  asset_code?: string;
-  asset_issuer?: string;
-  balance: string;
-  limit?: string;
-  buying_liabilities?: string;
-  selling_liabilities?: string;
-}
-
-export type {
-  HorizonAccount,
-  HorizonBalance,
-  HorizonLedger,
-  HorizonOperation,
-  HorizonTransaction,
+export {
+  PAGE_LIMIT,
+  HorizonValidationError,
+  validateHorizonAccount,
+  validateHorizonLatestLedger,
+  validateHorizonLedger,
+  validateHorizonOperation,
+  validateHorizonPage,
+  validateHorizonTrade,
+  validateHorizonTransaction,
+  type HorizonAccount,
+  type HorizonBalance,
+  type HorizonLatestLedger,
+  type HorizonLedger,
+  type HorizonOperation,
+  type HorizonPage,
+  type HorizonTrade,
+  type HorizonTradePrice,
+  type HorizonTradesFilter,
+  type HorizonTransaction,
 } from '@lumina/shared';
-export { PAGE_LIMIT } from '@lumina/shared';
+
+const log = subsystem('horizon');
+
+let client = createHorizonClient({
+  name: 'horizon',
+  minIntervalMs: parseInt(process.env['HORIZON_MIN_REQUEST_INTERVAL_MS'] ?? '100', 10),
+  maxIntervalMs: parseInt(process.env['HORIZON_MAX_REQUEST_INTERVAL_MS'] ?? '10000', 10),
+  authToken: process.env['HORIZON_AUTH_TOKEN'],
+  tipWeightFactor: parseFloat(process.env['HORIZON_TIP_WEIGHT_FACTOR'] ?? '2'),
+  metrics: {
+    requestsTotal: horizonRequests,
+    requestDuration: horizonRequestDuration,
+    currentInterval: horizonThrottleInterval,
+    queuedRequests: horizonQueuedRequests,
+    waitTime: horizonWaitTime,
+  },
+  logger: log,
+});
 
 /**
- * Configuration the indexer passes to the shared Horizon client at startup.
- *
- * - `minIntervalMs` / `maxIntervalMs` — bounds for the adaptive request throttle.
- * - `authToken` — optional Bearer token for authenticated Horizon endpoints with
- *   higher rate limits; never logged.
- * - `tipWeightFactor` — relative priority for tip vs backfill requests.
+ * Re-initialize the Horizon client with updated adaptive rate-limiting options.
  */
-interface HorizonClientConfig {
-  minIntervalMs: number;
-  maxIntervalMs: number;
+export function initializeHorizonClient(options: {
+  minIntervalMs?: number;
+  maxIntervalMs?: number;
   authToken?: string;
-  tipWeightFactor: number;
-}
-
-/** Per-request timeout, overridable via `HORIZON_REQUEST_TIMEOUT_MS`. */
-const REQUEST_TIMEOUT_MS = parseInt(process.env.HORIZON_REQUEST_TIMEOUT_MS ?? '10000', 10);
-
-/** The shared client instance, initialised once at startup. */
-let client: ReturnType<typeof createHorizonClient>;
-
-/**
- * Creates and stores the shared Horizon client with the indexer's metrics,
- * logger, and pacing configuration.
- *
- * Must be called once during startup before any fetch function is used; the
- * exported functions below delegate to the stored client.
- */
-export function initializeHorizonClient(config: HorizonClientConfig): void {
+  tipWeightFactor?: number;
+}) {
   client = createHorizonClient({
     name: 'horizon',
-    minIntervalMs: config.minIntervalMs,
-    requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    minIntervalMs: options.minIntervalMs ?? 100,
+    maxIntervalMs: options.maxIntervalMs ?? 10000,
+    authToken: options.authToken,
+    tipWeightFactor: options.tipWeightFactor ?? 2,
     metrics: {
       requestsTotal: horizonRequests,
       requestDuration: horizonRequestDuration,
@@ -142,78 +90,76 @@ export function initializeHorizonClient(config: HorizonClientConfig): void {
       queuedRequests: horizonQueuedRequests,
       waitTime: horizonWaitTime,
     },
-    logger: subsystem('horizon'),
+    logger: log,
   });
 }
 
 /**
- * Returns the latest ledger sequence Horizon reports for the given network.
- *
- * Fetches `/ledgers?order=desc&limit=1` and reads the first record's sequence.
- * Returns `0` when Horizon has no records (an empty network or a misconfigured
- * URL).
+ * Fetch the sequence number of the most recently closed ledger on `horizonUrl`.
+ * Returns `0` if Horizon returns an empty record list.
  */
-export function getLatestLedgerSequence(horizonUrl: string): Promise<number> {
-  return client.getLatestLedgerSequence(horizonUrl);
+export function getLatestLedgerSequence(
+  horizonUrl: string,
+  purpose: RequestPurpose = 'tip'
+): Promise<number> {
+  return client.getLatestLedgerSequence(horizonUrl, purpose);
 }
 
 /**
- * Fetches a single ledger by sequence number.
- *
- * Throws on a non-OK response (e.g. 404 for a ledger that does not exist yet)
- * because the indexer's ledger walk must not silently skip a missing ledger.
+ * Fetch metadata for a single ledger by sequence number.
  */
-export function getLedger(horizonUrl: string, sequence: number): Promise<HorizonLedger> {
-  return client.getLedger(sequence, horizonUrl);
+export function getLedger(
+  horizonUrl: string,
+  sequence: number,
+  purpose: RequestPurpose = 'default'
+): Promise<HorizonLedger> {
+  return client.getLedger(sequence, horizonUrl, purpose);
 }
 
 /**
- * Fetches all transactions for a ledger, following pagination links.
- *
- * Uses `PAGE_LIMIT` records per page; a short final page (fewer than
- * `PAGE_LIMIT` records) stops pagination without an extra round-trip.
+ * Fetch all transactions in a ledger, following Horizon cursor pagination
+ * (`_links.next.href`) when a page reaches `PAGE_LIMIT`.
  */
 export function getLedgerTransactions(
   horizonUrl: string,
   sequence: number,
+  purpose: RequestPurpose = 'default'
 ): Promise<HorizonTransaction[]> {
-  return client.getLedgerTransactions(sequence, horizonUrl);
+  return client.getLedgerTransactions(sequence, horizonUrl, purpose);
 }
 
 /**
- * Fetches all operations for a ledger, following pagination links.
- *
- * Operations include the `source_account` plus type-specific fields in an
- * open-ended index signature, so payment, path-payment, and manage-offer
- * details are all accessible without a union type per operation type.
+ * Fetch all operations in a ledger, following Horizon cursor pagination
+ * (`_links.next.href`) when a page reaches `PAGE_LIMIT`.
  */
 export function getLedgerOperations(
   horizonUrl: string,
   sequence: number,
+  purpose: RequestPurpose = 'default'
 ): Promise<HorizonOperation[]> {
-  return client.getLedgerOperations(sequence, horizonUrl);
+  return client.getLedgerOperations(sequence, horizonUrl, purpose);
 }
 
 /**
- * Fetches an account from Horizon.
- *
- * Returns `null` for accounts that don't exist or have been merged away (a 404),
- * so the indexer can treat "not found" as "not yet created" rather than an
- * error. Transient failures (429, 5xx) throw so queued refreshes can retry.
+ * Fetch an account's current state from Horizon.
+ * Returns `null` when Horizon responds with `404` (unfunded / merged account)
+ * and throws on transient failures after retries so queued refreshes can retry.
  */
-export function getAccount(horizonUrl: string, address: string): Promise<HorizonAccount | null> {
-  return client.getAccount(address, horizonUrl);
+export function getAccount(
+  horizonUrl: string,
+  address: string,
+  purpose: RequestPurpose = 'default'
+): Promise<HorizonAccount | null> {
+  return client.getAccount(address, horizonUrl, purpose);
 }
 
 /**
- * Fetches trades from Horizon, optionally filtered by asset pair, offer, or
- * cursor. Returns an empty array when no trades match.
+ * Fetch a page of trade executions from Horizon `/trades` (or `/accounts/:id/trades`).
  */
 export function getTrades(
   horizonUrl: string,
-  params?: HorizonTradesFilter
+  params?: HorizonTradesFilter,
+  purpose: RequestPurpose = 'default'
 ): Promise<HorizonTrade[]> {
-  return client.getTrades(params, horizonUrl);
+  return client.getTrades(params, horizonUrl, purpose);
 }
-
-export type { HorizonTrade, HorizonTradePrice, HorizonTradesFilter };
